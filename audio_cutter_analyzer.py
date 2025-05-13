@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import threading
 import time
+import tempfile
 
 from pydub import AudioSegment
 from pydub.silence import detect_nonsilent
@@ -20,11 +21,24 @@ def abbreviate_text(text, max_words=30):
         return text
     return " ".join(words[:max_words]) + "..."
 
+
 def transcribe_audio_segment(segment_path):
     recognizer = sr.Recognizer()
+    
     try:
-        with sr.AudioFile(str(segment_path)) as source:
+        audio_segment_pydub = AudioSegment.from_file(str(segment_path))
+    except Exception as e:
+        return f"Pydub could not load segment {segment_path.name}: {e}"
+
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav_file:
+            temp_wav_path = tmp_wav_file.name
+        
+        audio_segment_pydub.export(temp_wav_path, format="wav")
+
+        with sr.AudioFile(temp_wav_path) as source:
             audio_data = recognizer.record(source)
+        
         text = recognizer.recognize_google(audio_data)
         return text
     except sr.UnknownValueError:
@@ -32,7 +46,13 @@ def transcribe_audio_segment(segment_path):
     except sr.RequestError as e:
         return f"Speech recognition service error; {e}"
     except Exception as e:
-        return f"Transcription error: {e}"
+        return f"Transcription error (processing {segment_path.name}): {e}"
+    finally:
+        if 'temp_wav_path' in locals() and os.path.exists(temp_wav_path):
+            try:
+                os.remove(temp_wav_path)
+            except Exception as e:
+                print(f"Warning: Could not delete temporary file {temp_wav_path}: {e}")
 
 def process_audio_file(audio_file_path, base_output_dir, log_callback):
     original_file_path_str = str(audio_file_path)
