@@ -89,12 +89,14 @@ This Python script analyzes a folder of audio files (MP3 or WAV), segments them 
                 {
                     "abbreviated_text": "This is an abbreviated version of the transcribed text...",
                     "segment_file": "D:\\path\\to\\your\\output\\segments\\original_audio1\\original_audio1_segment_000.mp3",
-                    "timestamp_ms": 1234
+                    "timestamp_ms": 1234,
+                    "segment_duration_ms": 5678
                 },
                 {
                     "abbreviated_text": "Another piece of transcribed text, also abbreviated...",
                     "segment_file": "D:\\path\\to\\your\\output\\segments\\original_audio1\\original_audio1_segment_001.mp3",
-                    "timestamp_ms": 5678
+                    "timestamp_ms": 8000,
+                    "segment_duration_ms": 4321
                 }
             ],
             "C:\\path\\to\\your\\audio\\folder\\another_audio.wav": [
@@ -105,6 +107,7 @@ This Python script analyzes a folder of audio files (MP3 or WAV), segments them 
         *   `abbreviated_text`: An abbreviated version (e.g., first 30 words) of the transcribed text from the segment.
         *   `segment_file`: The full path to the exported audio segment file.
         *   `timestamp_ms`: The start time (in milliseconds) of this non-silent segment in the *original* audio file.
+        *   `segment_duration_ms`: The duration (in milliseconds) of this specific clipped audio segment.
 
 ## Important Notes & Configuration
 

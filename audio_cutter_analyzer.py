@@ -5,13 +5,11 @@ import json
 from pathlib import Path
 import threading
 import time
-import tempfile
 
 from pydub import AudioSegment
 from pydub.silence import detect_nonsilent
 import speech_recognition as sr
-
-# --- Core Processing Logic ---
+import tempfile
 
 def abbreviate_text(text, max_words=30):
     if not text:
@@ -20,7 +18,6 @@ def abbreviate_text(text, max_words=30):
     if len(words) <= max_words:
         return text
     return " ".join(words[:max_words]) + "..."
-
 
 def transcribe_audio_segment(segment_path):
     recognizer = sr.Recognizer()
@@ -57,6 +54,7 @@ def transcribe_audio_segment(segment_path):
 def process_audio_file(audio_file_path, base_output_dir, log_callback):
     original_file_path_str = str(audio_file_path)
     log_callback(f"Processing: {audio_file_path.name}")
+    log_callback(f"Attempting to load from: {str(audio_file_path.resolve())}")
 
     try:
         audio = AudioSegment.from_file(audio_file_path)
@@ -64,9 +62,9 @@ def process_audio_file(audio_file_path, base_output_dir, log_callback):
         log_callback(f"Error loading {audio_file_path.name}: {e}")
         return None
 
-    min_silence_len_ms = 700
-    silence_thresh_dbfs = -40
-    keep_silence_ms = 200
+    min_silence_len_ms = 500
+    silence_thresh_dbfs = -50
+    keep_silence_ms = 300
 
     nonsilent_ranges = detect_nonsilent(
         audio,
@@ -90,32 +88,34 @@ def process_audio_file(audio_file_path, base_output_dir, log_callback):
         end_ms_padded = min(len(audio), end_ms + keep_silence_ms)
         
         segment = audio[start_ms_padded:end_ms_padded]
+        segment_duration_ms = len(segment)
+
         segment_filename = f"{file_stem}_segment_{i:03d}{audio_file_path.suffix}"
         segment_path = file_output_dir / segment_filename
         
         try:
             segment.export(segment_path, format=audio_file_path.suffix[1:])
-            log_callback(f"  Exported: {segment_path.name}")
+            log_callback(f"  Exported: {segment_path.name} (Duration: {segment_duration_ms}ms)")
         except Exception as e:
             log_callback(f"  Error exporting {segment_path.name}: {e}")
             continue
 
         transcribed_text = transcribe_audio_segment(segment_path)
-        log_callback(f"    Transcribed: \"{transcribed_text[:50]}...\"")
+        log_callback(f"    Transcribed: \"{abbreviate_text(transcribed_text, 10)}...\"")
         
         abbreviated_transcription = abbreviate_text(transcribed_text)
         
         segments_data.append({
             "abbreviated_text": abbreviated_transcription,
             "segment_file": str(segment_path.resolve()),
-            "timestamp_ms": start_ms
+            "timestamp_ms": start_ms,
+            "segment_duration_ms": segment_duration_ms
         })
         time.sleep(0.1) 
 
     if segments_data:
         return {original_file_path_str: segments_data}
     return None
-
 
 # --- GUI Application ---
 class AudioAnalyzerApp:
@@ -215,7 +215,7 @@ class AudioAnalyzerApp:
             file_result = process_audio_file(audio_file, output_dir, self.log_message)
             if file_result:
                 all_results.update(file_result)
-            time.sleep(0.1)
+            time.sleep(0.1) # Small pause between files
 
         try:
             with open(json_output_file, 'w', encoding='utf-8') as f:
