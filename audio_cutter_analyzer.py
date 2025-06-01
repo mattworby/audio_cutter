@@ -1,15 +1,20 @@
-import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext
 import os
 import json
 from pathlib import Path
-import threading
 import time
+import wave
+import struct
 
-from pydub import AudioSegment
-from pydub.silence import detect_nonsilent
 import speech_recognition as sr
-import tempfile
+
+# --- Configuration Variables (Edit these values) ---
+INPUT_FOLDER = "C:\\User\\Path\\To\\source" # <<< Set your input folder path here
+OUTPUT_FOLDER = "C:\\User\\Path\\To\\dest" # <<< Set your output segments folder path here
+JSON_OUTPUT_FILE = "C:\\Users\\Path\\To\\file.json" # <<< Set your JSON output file path here
+
+MIN_SILENCE_LEN_MS = 700      # Minimum length of silence (ms) to consider for a split
+SILENCE_THRESHOLD_AMP = 0.01  # RMS amplitude threshold (0.0 to 1.0, normalized) below which audio is considered silent
+KEEP_SILENCE_MS = 200         # Milliseconds of silence to keep at the beginning/end of each segment
 
 def abbreviate_text(text, max_words=30):
     if not text:
@@ -19,23 +24,11 @@ def abbreviate_text(text, max_words=30):
         return text
     return " ".join(words[:max_words]) + "..."
 
-def transcribe_audio_segment(segment_path):
+def transcribe_audio_segment(segment_path, log_callback):
     recognizer = sr.Recognizer()
-    
     try:
-        audio_segment_pydub = AudioSegment.from_file(str(segment_path))
-    except Exception as e:
-        return f"Pydub could not load segment {segment_path.name}: {e}"
-
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_wav_file:
-            temp_wav_path = tmp_wav_file.name
-        
-        audio_segment_pydub.export(temp_wav_path, format="wav")
-
-        with sr.AudioFile(temp_wav_path) as source:
+        with sr.AudioFile(str(segment_path)) as source:
             audio_data = recognizer.record(source)
-        
         text = recognizer.recognize_google(audio_data)
         return text
     except sr.UnknownValueError:
@@ -43,38 +36,96 @@ def transcribe_audio_segment(segment_path):
     except sr.RequestError as e:
         return f"Speech recognition service error; {e}"
     except Exception as e:
-        return f"Transcription error (processing {segment_path.name}): {e}"
-    finally:
-        if 'temp_wav_path' in locals() and os.path.exists(temp_wav_path):
-            try:
-                os.remove(temp_wav_path)
-            except Exception as e:
-                print(f"Warning: Could not delete temporary file {temp_wav_path}: {e}")
+        return f"Transcription error: {e}"
 
-def process_audio_file(audio_file_path, base_output_dir, log_callback):
-    original_file_path_str = str(audio_file_path)
+def calculate_rms(samples):
+    """Calculate RMS for a list of audio samples."""
+    if not samples:
+        return 0.0
+    return (sum(s**2 for s in samples) / len(samples))**0.5
+
+def process_audio_file(audio_file_path, base_output_dir, log_callback,
+                        min_silence_len_ms, silence_threshold_amp, keep_silence_ms):
+    original_file_path_str = str(audio_file_path.resolve())
     log_callback(f"Processing: {audio_file_path.name}")
-    log_callback(f"Attempting to load from: {str(audio_file_path.resolve())}")
+    log_callback(f"Attempting to load from: {original_file_path_str}")
 
     try:
-        audio = AudioSegment.from_file(audio_file_path)
+        with wave.open(str(audio_file_path), 'rb') as wf:
+            nchannels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            framerate = wf.getframerate()
+            nframes = wf.getnframes()
+            raw_frames = wf.readframes(nframes)
     except Exception as e:
-        log_callback(f"Error loading {audio_file_path.name}: {e}")
+        log_callback(f"Error loading WAV file {audio_file_path.name}: {e}")
         return None
 
-    min_silence_len_ms = 500
-    silence_thresh_dbfs = -50
-    keep_silence_ms = 300
+    max_amplitude = 2**(sampwidth * 8 - 1) - 1 if sampwidth > 0 else 1
 
-    nonsilent_ranges = detect_nonsilent(
-        audio,
-        min_silence_len=min_silence_len_ms,
-        silence_thresh=silence_thresh_dbfs,
-        seek_step=1
-    )
+    format_char = {1: 'b', 2: 'h', 4: 'i'}.get(sampwidth)
+    
+    if format_char is None:
+        log_callback(f"Unsupported sample width ({sampwidth} bytes) for {audio_file_path.name}. Only 1, 2, or 4 bytes supported.")
+        return None
+    
+    all_samples = []
+    if sampwidth == 3:
+        for i in range(0, len(raw_frames), 3 * nchannels):
+            for ch in range(nchannels):
+                sample_bytes = raw_frames[i + ch * 3 : i + ch * 3 + 3]
+                if sample_bytes[2] & 0x80:
+                    padded_sample_bytes = sample_bytes + b'\xFF'
+                else:
+                    padded_sample_bytes = sample_bytes + b'\x00'
+                all_samples.extend(struct.unpack('<i', padded_sample_bytes))
+    else:
+        num_samples = nframes * nchannels
+        all_samples = list(struct.unpack('<' + format_char * num_samples, raw_frames))
+
+    absolute_silence_threshold = silence_threshold_amp * max_amplitude
+
+    nonsilent_ranges = []
+    current_start = 0
+    in_nonsilent_period = False
+    
+    chunk_size_samples = int(framerate * 0.050) 
+    if chunk_size_samples == 0: chunk_size_samples = 1
+
+    for i in range(0, len(all_samples), chunk_size_samples * nchannels):
+        chunk_samples = all_samples[i : i + chunk_size_samples * nchannels]
+        
+        chunk_rms = calculate_rms(chunk_samples)
+
+        is_silent = chunk_rms < absolute_silence_threshold
+
+        current_time_ms = (i // nchannels) * 1000 // framerate
+
+        if not is_silent and not in_nonsilent_period:
+            current_start = current_time_ms
+            in_nonsilent_period = True
+        elif is_silent and in_nonsilent_period:            
+            actual_nonsilent_end_ms = current_time_ms
+            j = i
+            while j < len(all_samples):
+                next_chunk = all_samples[j : j + chunk_size_samples * nchannels]
+                if not next_chunk:
+                    break
+                next_chunk_rms = calculate_rms(next_chunk)
+                if next_chunk_rms >= absolute_silence_threshold:
+                    break
+                actual_nonsilent_end_ms = (j // nchannels) * 1000 // framerate
+                j += chunk_size_samples * nchannels
+
+            if (actual_nonsilent_end_ms - current_time_ms) >= min_silence_len_ms:
+                nonsilent_ranges.append([current_start, current_time_ms])
+                in_nonsilent_period = False
+            
+    if in_nonsilent_period:
+        nonsilent_ranges.append([current_start, (nframes * 1000) // framerate])
 
     if not nonsilent_ranges:
-        log_callback(f"No non-silent audio found in {audio_file_path.name}")
+        log_callback(f"No non-silent audio found in {audio_file_path.name} with current settings.")
         return None
 
     file_stem = audio_file_path.stem
@@ -85,22 +136,33 @@ def process_audio_file(audio_file_path, base_output_dir, log_callback):
 
     for i, (start_ms, end_ms) in enumerate(nonsilent_ranges):
         start_ms_padded = max(0, start_ms - keep_silence_ms)
-        end_ms_padded = min(len(audio), end_ms + keep_silence_ms)
+        end_ms_padded = min((nframes * 1000) // framerate, end_ms + keep_silence_ms)
         
-        segment = audio[start_ms_padded:end_ms_padded]
-        segment_duration_ms = len(segment)
+        start_frame = int(start_ms_padded * framerate // 1000)
+        end_frame = int(end_ms_padded * framerate // 1000)
+        
+        start_byte = start_frame * nchannels * sampwidth
+        end_byte = end_frame * nchannels * sampwidth
+        
+        segment_raw_frames = raw_frames[start_byte:end_byte]
+        
+        segment_duration_ms = end_ms_padded - start_ms_padded
 
-        segment_filename = f"{file_stem}_segment_{i:03d}{audio_file_path.suffix}"
+        segment_filename = f"{file_stem}_segment_{i:03d}.wav"
         segment_path = file_output_dir / segment_filename
         
         try:
-            segment.export(segment_path, format=audio_file_path.suffix[1:])
+            with wave.open(str(segment_path), 'wb') as new_wf:
+                new_wf.setnchannels(nchannels)
+                new_wf.setsampwidth(sampwidth)
+                new_wf.setframerate(framerate)
+                new_wf.writeframes(segment_raw_frames)
             log_callback(f"  Exported: {segment_path.name} (Duration: {segment_duration_ms}ms)")
         except Exception as e:
             log_callback(f"  Error exporting {segment_path.name}: {e}")
             continue
 
-        transcribed_text = transcribe_audio_segment(segment_path)
+        transcribed_text = transcribe_audio_segment(segment_path, log_callback)
         log_callback(f"    Transcribed: \"{abbreviate_text(transcribed_text, 10)}...\"")
         
         abbreviated_transcription = abbreviate_text(transcribed_text)
@@ -111,124 +173,54 @@ def process_audio_file(audio_file_path, base_output_dir, log_callback):
             "timestamp_ms": start_ms,
             "segment_duration_ms": segment_duration_ms
         })
-        time.sleep(0.1) 
+        time.sleep(0.1)
 
     if segments_data:
         return {original_file_path_str: segments_data}
     return None
 
-# --- GUI Application ---
-class AudioAnalyzerApp:
-    def __init__(self, root):
-        self.root = root
-        root.title("Audio Analyzer")
+def main():
+    input_dir = Path(INPUT_FOLDER)
+    output_dir = Path(OUTPUT_FOLDER)
+    json_output_file = Path(JSON_OUTPUT_FILE)
 
-        tk.Label(root, text="Input Audio Folder:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
-        self.input_folder_entry = tk.Entry(root, width=50)
-        self.input_folder_entry.grid(row=0, column=1, padx=5, pady=5)
-        tk.Button(root, text="Browse...", command=self.browse_input_folder).grid(row=0, column=2, padx=5, pady=5)
+    if not input_dir.is_dir():
+        print(f"Error: Input folder '{input_dir}' does not exist. Please check INPUT_FOLDER variable.")
+        return
 
-        tk.Label(root, text="Output Segments Folder:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
-        self.output_folder_entry = tk.Entry(root, width=50)
-        self.output_folder_entry.grid(row=1, column=1, padx=5, pady=5)
-        tk.Button(root, text="Browse...", command=self.browse_output_folder).grid(row=1, column=2, padx=5, pady=5)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-        tk.Label(root, text="JSON Output File:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
-        self.json_file_entry = tk.Entry(root, width=50)
-        self.json_file_entry.grid(row=2, column=1, padx=5, pady=5)
-        tk.Button(root, text="Save As...", command=self.browse_json_file).grid(row=2, column=2, padx=5, pady=5)
+    all_results = {}
+    audio_files = [f for f in input_dir.glob('*.wav')]
 
-        self.start_button = tk.Button(root, text="Start Processing", command=self.start_processing_thread)
-        self.start_button.grid(row=3, column=0, columnspan=3, pady=10)
+    if not audio_files:
+        print(f"No .wav files found in the input folder: {input_dir}.")
+        return
 
-        tk.Label(root, text="Log:").grid(row=4, column=0, sticky="nw", padx=5, pady=5)
-        self.log_area = scrolledtext.ScrolledText(root, width=70, height=15, wrap=tk.WORD)
-        self.log_area.grid(row=5, column=0, columnspan=3, padx=5, pady=5)
-        self.log_area.config(state=tk.DISABLED)
-
-    def _browse_folder(self, entry_widget):
-        folder_selected = filedialog.askdirectory()
-        if folder_selected:
-            entry_widget.delete(0, tk.END)
-            entry_widget.insert(0, folder_selected)
-
-    def browse_input_folder(self):
-        self._browse_folder(self.input_folder_entry)
-
-    def browse_output_folder(self):
-        self._browse_folder(self.output_folder_entry)
-
-    def browse_json_file(self):
-        file_selected = filedialog.asksaveasfilename(
-            defaultextension=".json",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+    total_files = len(audio_files)
+    for i, audio_file in enumerate(audio_files):
+        print(f"\n--- Processing file {i+1}/{total_files}: {audio_file.name} ---")
+        def current_file_logger(message):
+            print(f"  {message}")
+        
+        file_result = process_audio_file(
+            audio_file,
+            output_dir,
+            current_file_logger,
+            MIN_SILENCE_LEN_MS,
+            SILENCE_THRESHOLD_AMP,
+            KEEP_SILENCE_MS
         )
-        if file_selected:
-            self.json_file_entry.delete(0, tk.END)
-            self.json_file_entry.insert(0, file_selected)
+        if file_result:
+            all_results.update(file_result)
+        time.sleep(0.1)
 
-    def log_message(self, message):
-        def _update_log():
-            self.log_area.config(state=tk.NORMAL)
-            self.log_area.insert(tk.END, message + "\n")
-            self.log_area.see(tk.END)
-            self.log_area.config(state=tk.DISABLED)
-        self.root.after(0, _update_log) 
-
-    def start_processing_thread(self):
-        input_folder = self.input_folder_entry.get()
-        output_folder = self.output_folder_entry.get()
-        json_file_path = self.json_file_entry.get()
-
-        if not all([input_folder, output_folder, json_file_path]):
-            messagebox.showerror("Error", "All paths must be specified.")
-            return
-        
-        if not Path(input_folder).is_dir():
-            messagebox.showerror("Error", "Input folder does not exist.")
-            return
-        
-        Path(output_folder).mkdir(parents=True, exist_ok=True)
-
-        self.start_button.config(state=tk.DISABLED)
-        self.log_message("Starting processing...")
-
-        thread = threading.Thread(target=self.run_processing, args=(input_folder, output_folder, json_file_path), daemon=True)
-        thread.start()
-
-    def run_processing(self, input_folder_str, output_folder_str, json_file_path_str):
-        input_dir = Path(input_folder_str)
-        output_dir = Path(output_folder_str)
-        json_output_file = Path(json_file_path_str)
-        
-        all_results = {}
-        audio_files = [f for f in input_dir.glob('*') if f.suffix.lower() in ('.mp3', '.wav')]
-
-        if not audio_files:
-            self.log_message("No .mp3 or .wav files found in the input folder.")
-            self.root.after(0, lambda: self.start_button.config(state=tk.NORMAL))
-            return
-
-        total_files = len(audio_files)
-        for i, audio_file in enumerate(audio_files):
-            self.log_message(f"--- Progress: {i+1}/{total_files} ---")
-            file_result = process_audio_file(audio_file, output_dir, self.log_message)
-            if file_result:
-                all_results.update(file_result)
-            time.sleep(0.1) # Small pause between files
-
-        try:
-            with open(json_output_file, 'w', encoding='utf-8') as f:
-                json.dump(all_results, f, indent=4, ensure_ascii=False)
-            self.log_message(f"Processing complete. Results saved to {json_output_file}")
-        except Exception as e:
-            self.log_message(f"Error saving JSON file: {e}")
-            messagebox.showerror("JSON Save Error", f"Could not save JSON: {e}")
-
-        self.root.after(0, lambda: self.start_button.config(state=tk.NORMAL))
-
+    try:
+        with open(json_output_file, 'w', encoding='utf-8') as f:
+            json.dump(all_results, f, indent=4, ensure_ascii=False)
+        print(f"\nProcessing complete. Results saved to {json_output_file}")
+    except Exception as e:
+        print(f"Error saving JSON file: {e}")
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = AudioAnalyzerApp(root)
-    root.mainloop()
+    main()
